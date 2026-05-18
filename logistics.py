@@ -5,11 +5,11 @@ assert version.parse(sklearn.__version__) >= version.parse("1.0.1")
 import seaborn as sns
 
 from pathlib import Path
+from math import radians, sin, cos, sqrt, atan2
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from zlib import crc32
-
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 from pandas.plotting import scatter_matrix
 from sklearn.impute import SimpleImputer
@@ -31,6 +31,15 @@ from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import randint
 
 
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1-a))
+
+
 def load_data():
     path = Path("C:/Users/Grace/mlprojects/data/")
     orders = pd.read_csv(path / "olist_orders_dataset.csv")
@@ -38,10 +47,16 @@ def load_data():
     products = pd.read_csv(path / "olist_products_dataset.csv")
     sellers = pd.read_csv(path / "olist_sellers_dataset.csv")
     customers = pd.read_csv(path / "olist_customers_dataset.csv")
+    geo = pd.read_csv(path / "olist_geolocation_dataset.csv")
+    geo = geo.groupby("geolocation_zip_code_prefix")[["geolocation_lat", "geolocation_lng"]].mean()
     df = orders.merge(order_items, on="order_id")
     df = df.merge(products, on="product_id")
     df = df.merge(sellers, on="seller_id")
     df = df.merge(customers, on="customer_id")
+    df = df.merge(geo, left_on="seller_zip_code_prefix", right_index=True)
+    df = df.rename(columns={"geolocation_lat": "seller_lat", "geolocation_lng": "seller_lng"})
+    df = df.merge(geo, left_on="customer_zip_code_prefix", right_index=True)
+    df = df.rename(columns={"geolocation_lat": "customer_lat", "geolocation_lng": "customer_lng"})
     return df
 
 logistics = load_data()
@@ -111,24 +126,32 @@ logistics["customer_state_cat"] = logistics["customer_state"].astype("category")
 logistics["zip_distance"] = abs(logistics["customer_zip_code_prefix"] - logistics["seller_zip_code_prefix"])
 logistics["product_volume"] = logistics["product_length_cm"] * logistics["product_height_cm"] * logistics["product_width_cm"]
 logistics["freight_ratio"] = logistics["freight_value"] / logistics["price"].replace(0, np.nan)
+logistics["real_distance_km"] = logistics.apply(
+    lambda row: haversine(row["seller_lat"], row["seller_lng"],
+                          row["customer_lat"], row["customer_lng"]), axis=1
+)
+logistics["seller_customer_lat_diff"] = abs(logistics["customer_lat"] - logistics["seller_lat"])
+logistics["seller_customer_lng_diff"] = abs(logistics["customer_lng"] - logistics["seller_lng"])
+logistics["freight_per_km"] = logistics["freight_value"] / logistics["real_distance_km"].replace(0, np.nan)
+logistics["price_per_km"] = logistics["price"] / logistics["real_distance_km"].replace(0, np.nan)
 
 corr_matrix = logistics.corr(numeric_only=True)
 print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
 
 attributes = [
-    "zip_distance",
+    "real_distance_km",
+    "seller_customer_lat_diff",
+    "seller_customer_lng_diff",
     "freight_value",
-    "product_weight_g",
-    "customer_zip_code_prefix",
     "estimated_delivery_days"
 ]
 
 scatter_matrix(logistics[attributes], figsize=(12, 8))
-plt.show()
+#plt.show()
 
-logistics.plot(kind="scatter", x="zip_distance", y="estimated_delivery_days",
+logistics.plot(kind="scatter", x="real_distance_km", y="estimated_delivery_days",
                alpha=0.1, grid=True)
-plt.show()
+#plt.show()
 
 corr_matrix = logistics.corr(numeric_only=True)
 print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
@@ -144,6 +167,14 @@ logistics["customer_state_cat"] = logistics["customer_state"].astype("category")
 logistics["zip_distance"] = abs(logistics["customer_zip_code_prefix"] - logistics["seller_zip_code_prefix"])
 logistics["product_volume"] = logistics["product_length_cm"] * logistics["product_height_cm"] * logistics["product_width_cm"]
 logistics["freight_ratio"] = logistics["freight_value"] / logistics["price"].replace(0, np.nan)
+logistics["real_distance_km"] = logistics.apply(
+    lambda row: haversine(row["seller_lat"], row["seller_lng"],
+                          row["customer_lat"], row["customer_lng"]), axis=1
+)
+logistics["seller_customer_lat_diff"] = abs(logistics["customer_lat"] - logistics["seller_lat"])
+logistics["seller_customer_lng_diff"] = abs(logistics["customer_lng"] - logistics["seller_lng"])
+logistics["freight_per_km"] = logistics["freight_value"] / logistics["real_distance_km"].replace(0, np.nan)
+logistics["price_per_km"] = logistics["price"] / logistics["real_distance_km"].replace(0, np.nan)
 
 imputer = SimpleImputer(strategy="median")
 
@@ -170,7 +201,7 @@ print(logistics_categorical_1hot.toarray())
 df_test_unknown = pd.DataFrame({
     "seller_state": ["SP", "XX"],
     "customer_state": ["RJ", "YY"],
-    "product_category_name": ["electronics", "unknown_category"]
+    "product_category_name": ["eletronicos", "unknown_category"]
 })
 
 categorical_encoder.handle_unknown = "ignore"
@@ -184,9 +215,11 @@ num_pipeline = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
 logistics_num_prepared = num_pipeline.fit_transform(logistics_numerical_data_only)
 print(logistics_num_prepared[:2].round(2))
 
-num_attribs = ["zip_distance", "customer_zip_code_prefix", "freight_value",
-               "seller_zip_code_prefix", "freight_ratio", "product_weight_g",
-               "product_volume", "customer_state_cat", "seller_state_cat"]
+num_attribs = ["real_distance_km", "seller_customer_lng_diff", "seller_customer_lat_diff",
+               "zip_distance", "customer_zip_code_prefix", "customer_lat",
+               "freight_value", "seller_zip_code_prefix", "freight_ratio",
+               "product_weight_g", "product_volume", "customer_state_cat",
+               "seller_state_cat", "freight_per_km", "price_per_km"]
 cat_attribs = ["seller_state", "customer_state", "product_category_name"]
 
 def make_preprocessing():
@@ -206,7 +239,7 @@ lin_reg.fit(logistics, logistics_labels)
 tree_reg = make_pipeline(make_preprocessing(), DecisionTreeRegressor(random_state=42))
 tree_reg.fit(logistics, logistics_labels)
 
-forest_reg = make_pipeline(make_preprocessing(), RandomForestRegressor(random_state=42))
+forest_reg = make_pipeline(make_preprocessing(), RandomForestRegressor(random_state=42, n_estimators=50, max_depth=15, n_jobs=-1))
 forest_reg.fit(logistics, logistics_labels)
 
 print("Linear Regression:")

@@ -50,6 +50,12 @@ logistics["real_distance_km"] = logistics.apply(
     lambda row: haversine(row["seller_lat"], row["seller_lng"],
                           row["customer_lat"], row["customer_lng"]), axis=1
 )
+logistics["seller_customer_lat_diff"] = abs(logistics["customer_lat"] - logistics["seller_lat"])
+logistics["seller_customer_lng_diff"] = abs(logistics["customer_lng"] - logistics["seller_lng"])
+logistics["freight_per_km"] = logistics["freight_value"] / logistics["real_distance_km"].replace(0, np.nan)
+logistics["weight_per_km"] = logistics["product_weight_g"] / logistics["real_distance_km"].replace(0, np.nan)
+logistics["volume_per_km"] = logistics["product_volume"] / logistics["real_distance_km"].replace(0, np.nan)
+logistics["price_per_km"] = logistics["price"] / logistics["real_distance_km"].replace(0, np.nan)
 
 corr_matrix = logistics.corr(numeric_only=True)
 print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
