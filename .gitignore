@@ -1,0 +1,6 @@
+data/
+*.csv
+*.tgz
+__pycache__/
+*.pyc
+.env
