@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from zlib import crc32
+
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 from pandas.plotting import scatter_matrix
 from sklearn.impute import SimpleImputer
@@ -28,10 +29,6 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import cross_val_score, GridSearchCV, RandomizedSearchCV
 from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import randint
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
 
 
 def load_data():
@@ -54,8 +51,8 @@ logistics["order_purchase_timestamp"] = pd.to_datetime(logistics["order_purchase
 logistics["order_delivered_customer_date"] = pd.to_datetime(logistics["order_delivered_customer_date"])
 logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_estimated_delivery_date"])
 
-logistics["late_delivery"] = (logistics["order_delivered_customer_date"] > logistics["order_estimated_delivery_date"]).astype(int)
-logistics = logistics.dropna(subset=["late_delivery", "order_delivered_customer_date"])
+logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
+logistics = logistics.dropna(subset=["estimated_delivery_days", "order_delivered_customer_date"])
 
 categoricals = ["order_status", "product_category_name", "seller_state", "customer_state"]
 print(logistics[categoricals].value_counts())
@@ -77,16 +74,16 @@ logistics["weight_cat"] = pd.cut(
     labels=[1, 2, 3, 4, 5]
 )
 
-logistics["price_cat"] = pd.cut(
-    logistics["price"],
-    bins=[-np.inf, 50, 100, 200, 500, np.inf],
+logistics["delivery_days_cat"] = pd.cut(
+    logistics["estimated_delivery_days"],
+    bins=[-np.inf, 10, 20, 30, 40, np.inf],
     labels=[1, 2, 3, 4, 5]
 )
 
 logistics["seller_state_cat"] = logistics["seller_state"].astype("category").cat.codes
 logistics["customer_state_cat"] = logistics["customer_state"].astype("category").cat.codes
 
-cat_cols = ["freight_cat", "weight_cat", "price_cat", "seller_state_cat", "customer_state_cat"]
+cat_cols = ["freight_cat", "weight_cat", "delivery_days_cat", "seller_state_cat", "customer_state_cat"]
 print("\nNaN check:", logistics[cat_cols].isna().sum().to_dict())
 
 def create_multiple_splits(n_splits, test_size, random_state, category):
@@ -111,45 +108,43 @@ logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_est
 logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
 logistics["seller_state_cat"] = logistics["seller_state"].astype("category").cat.codes
 logistics["customer_state_cat"] = logistics["customer_state"].astype("category").cat.codes
-
-corr_matrix = logistics.corr(numeric_only=True)
-print(corr_matrix["late_delivery"].sort_values(ascending=False))
-
-attributes = [
-    "freight_value",
-    "price",
-    "product_weight_g",
-    "estimated_delivery_days",
-    "late_delivery"
-]
-
-scatter_matrix(logistics[attributes], figsize=(12, 8))
-#plt.show()
-
-logistics.plot(kind="scatter", x="estimated_delivery_days", y="late_delivery",
-               alpha=0.1, grid=True)
-#plt.show()
-
-logistics["price_per_gram"] = logistics["price"] / logistics["product_weight_g"].replace(0, np.nan)
+logistics["zip_distance"] = abs(logistics["customer_zip_code_prefix"] - logistics["seller_zip_code_prefix"])
+logistics["product_volume"] = logistics["product_length_cm"] * logistics["product_height_cm"] * logistics["product_width_cm"]
 logistics["freight_ratio"] = logistics["freight_value"] / logistics["price"].replace(0, np.nan)
 
 corr_matrix = logistics.corr(numeric_only=True)
-print(corr_matrix["late_delivery"].sort_values(ascending=False))
+print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
 
-logistics = train_set.drop("late_delivery", axis=1)
-logistics_labels = train_set["late_delivery"].copy()
+attributes = [
+    "zip_distance",
+    "freight_value",
+    "product_weight_g",
+    "customer_zip_code_prefix",
+    "estimated_delivery_days"
+]
+
+scatter_matrix(logistics[attributes], figsize=(12, 8))
+plt.show()
+
+logistics.plot(kind="scatter", x="zip_distance", y="estimated_delivery_days",
+               alpha=0.1, grid=True)
+plt.show()
+
+corr_matrix = logistics.corr(numeric_only=True)
+print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
+
+logistics = train_set.drop("estimated_delivery_days", axis=1)
+logistics_labels = train_set["estimated_delivery_days"].copy()
 
 logistics["order_purchase_timestamp"] = pd.to_datetime(logistics["order_purchase_timestamp"])
 logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_estimated_delivery_date"])
 logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
 logistics["seller_state_cat"] = logistics["seller_state"].astype("category").cat.codes
 logistics["customer_state_cat"] = logistics["customer_state"].astype("category").cat.codes
-logistics["price_per_gram"] = logistics["price"] / logistics["product_weight_g"].replace(0, np.nan)
+logistics["zip_distance"] = abs(logistics["customer_zip_code_prefix"] - logistics["seller_zip_code_prefix"])
+logistics["product_volume"] = logistics["product_length_cm"] * logistics["product_height_cm"] * logistics["product_width_cm"]
 logistics["freight_ratio"] = logistics["freight_value"] / logistics["price"].replace(0, np.nan)
 
-"""
-Data cleaning
-"""
 imputer = SimpleImputer(strategy="median")
 
 logistics_numerical_data_only = logistics.select_dtypes(include=[np.number])
@@ -165,9 +160,6 @@ logistics_tr = pd.DataFrame(X,
                             columns=logistics_numerical_data_only.columns,
                             index=logistics_numerical_data_only.index)
 
-"""
-turn categoricals into numerical values
-"""
 logistics_categoricals = logistics[["seller_state", "customer_state", "product_category_name"]]
 print(logistics_categoricals.head(8))
 
@@ -184,20 +176,17 @@ df_test_unknown = pd.DataFrame({
 categorical_encoder.handle_unknown = "ignore"
 categorical_encoder.transform(df_test_unknown)
 
-"""scaling and normalizing data"""
 std_scaler = StandardScaler()
 logistics_numerical_data_std_scaled = std_scaler.fit_transform(logistics_numerical_data_only)
 
-"""
-transform data
-"""
 num_pipeline = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
 
 logistics_num_prepared = num_pipeline.fit_transform(logistics_numerical_data_only)
 print(logistics_num_prepared[:2].round(2))
 
-num_attribs = ["freight_value", "price", "product_weight_g", "estimated_delivery_days",
-               "seller_state_cat", "customer_state_cat", "price_per_gram", "freight_ratio"]
+num_attribs = ["zip_distance", "customer_zip_code_prefix", "freight_value",
+               "seller_zip_code_prefix", "freight_ratio", "product_weight_g",
+               "product_volume", "customer_state_cat", "seller_state_cat"]
 cat_attribs = ["seller_state", "customer_state", "product_category_name"]
 
 def make_preprocessing():
@@ -211,29 +200,26 @@ def make_preprocessing():
         ("cat", cat_pipeline, cat_attribs)
     ])
 
-"""
-training models
-"""
-logistic_regression = make_pipeline(make_preprocessing(), LogisticRegression(random_state=42, max_iter=1000, class_weight="balanced"))
-logistic_regression.fit(logistics, logistics_labels)
+lin_reg = make_pipeline(make_preprocessing(), LinearRegression())
+lin_reg.fit(logistics, logistics_labels)
 
-tree_classifier = make_pipeline(make_preprocessing(), DecisionTreeClassifier(random_state=42, class_weight="balanced"))
-tree_classifier.fit(logistics, logistics_labels)
+tree_reg = make_pipeline(make_preprocessing(), DecisionTreeRegressor(random_state=42))
+tree_reg.fit(logistics, logistics_labels)
 
-forest_classifier = make_pipeline(make_preprocessing(), RandomForestClassifier(random_state=42, class_weight="balanced"))
-forest_classifier.fit(logistics, logistics_labels)
+forest_reg = make_pipeline(make_preprocessing(), RandomForestRegressor(random_state=42))
+forest_reg.fit(logistics, logistics_labels)
 
-print("Random Forest:")
-forest_scores = cross_val_score(forest_classifier, logistics, logistics_labels,
-                                scoring="f1", cv=10)
-print(pd.Series(forest_scores).describe())
+print("Linear Regression:")
+lin_scores = -cross_val_score(lin_reg, logistics, logistics_labels,
+                              scoring="neg_root_mean_squared_error", cv=10)
+print(pd.Series(lin_scores).describe())
 
 print("Decision Tree:")
-tree_scores = cross_val_score(tree_classifier, logistics, logistics_labels,
-                              scoring="f1", cv=10)
+tree_scores = -cross_val_score(tree_reg, logistics, logistics_labels,
+                               scoring="neg_root_mean_squared_error", cv=10)
 print(pd.Series(tree_scores).describe())
 
-print("Logistic Regression:")
-logistic_scores = cross_val_score(logistic_regression, logistics, logistics_labels,
-                                  scoring="f1", cv=10)
-print(pd.Series(logistic_scores).describe())
+print("Random Forest:")
+forest_scores = -cross_val_score(forest_reg, logistics, logistics_labels,
+                                 scoring="neg_root_mean_squared_error", cv=10)
+print(pd.Series(forest_scores).describe())
