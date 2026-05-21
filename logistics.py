@@ -51,7 +51,9 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1-a))
 
 
-def engineer_features(df):
+def engineer_features(df, seller_volume_map=None, route_freq_map=None, is_train=True):
+    df = df.copy()
+
     df["seller_state_cat"] = df["seller_state"].astype("category").cat.codes
     df["customer_state_cat"] = df["customer_state"].astype("category").cat.codes
     df["zip_distance"] = abs(df["customer_zip_code_prefix"] - df["seller_zip_code_prefix"])
@@ -86,8 +88,14 @@ def engineer_features(df):
     df["seller_region"] = df["seller_state"].map(brazil_regions)
     df["customer_region"] = df["customer_state"].map(brazil_regions)
     df["same_region"] = (df["seller_region"] == df["customer_region"]).astype(int)
-    df["seller_order_volume"] = df.groupby("seller_id")["order_id"].transform("count")
-    df["route_frequency"] = df.groupby("state_pair")["order_id"].transform("count")
+
+    if is_train:
+        df["seller_order_volume"] = df.groupby("seller_id")["order_id"].transform("count")
+        df["route_frequency"] = df.groupby("state_pair")["order_id"].transform("count")
+    else:
+        df["seller_order_volume"] = df["seller_id"].map(seller_volume_map).fillna(0)
+        df["route_frequency"] = df["state_pair"].map(route_freq_map).fillna(0)
+
     return df
 
 
@@ -120,41 +128,51 @@ logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_est
 logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
 logistics = logistics.dropna(subset=["estimated_delivery_days", "order_delivered_customer_date"])
 
-categoricals = ["order_status", "product_category_name", "seller_state", "customer_state"]
-print(logistics[categoricals].value_counts())
-
 train_set, test_set = train_test_split(logistics, test_size=0.2, random_state=42)
 print(len(train_set), len(test_set))
 
-logistics = logistics.dropna(subset=["product_weight_g", "freight_value", "price"])
+train_set = train_set.dropna(subset=["product_weight_g", "freight_value", "price"])
+train_set = train_set.copy()
+train_set["order_purchase_timestamp"] = pd.to_datetime(train_set["order_purchase_timestamp"])
+train_set["order_estimated_delivery_date"] = pd.to_datetime(train_set["order_estimated_delivery_date"])
+train_set["estimated_delivery_days"] = (train_set["order_estimated_delivery_date"] - train_set["order_purchase_timestamp"]).dt.days
+train_set["state_pair"] = train_set["seller_state"] + "_" + train_set["customer_state"]
 
-logistics["freight_cat"] = pd.cut(
-    logistics["freight_value"],
+seller_volume_map = train_set.groupby("seller_id")["order_id"].count()
+route_freq_map = train_set.groupby("state_pair")["order_id"].count()
+
+logistics_for_strat = train_set.copy()
+
+logistics_for_strat["freight_cat"] = pd.cut(
+    logistics_for_strat["freight_value"],
     bins=[-np.inf, 10, 20, 30, 50, np.inf],
     labels=[1, 2, 3, 4, 5]
 )
 
-logistics["weight_cat"] = pd.cut(
-    logistics["product_weight_g"],
+logistics_for_strat["weight_cat"] = pd.cut(
+    logistics_for_strat["product_weight_g"],
     bins=[-np.inf, 500, 1000, 2000, 5000, np.inf],
     labels=[1, 2, 3, 4, 5]
 )
 
-logistics["delivery_days_cat"] = pd.cut(
-    logistics["estimated_delivery_days"],
+logistics_for_strat["delivery_days_cat"] = pd.cut(
+    logistics_for_strat["estimated_delivery_days"],
     bins=[-np.inf, 10, 20, 30, 40, np.inf],
     labels=[1, 2, 3, 4, 5]
 )
 
-logistics["seller_state_cat"] = logistics["seller_state"].astype("category").cat.codes
-logistics["customer_state_cat"] = logistics["customer_state"].astype("category").cat.codes
+logistics_for_strat["seller_state_cat"] = logistics_for_strat["seller_state"].astype("category").cat.codes
+logistics_for_strat["customer_state_cat"] = logistics_for_strat["customer_state"].astype("category").cat.codes
 
 cat_cols = ["freight_cat", "weight_cat", "delivery_days_cat", "seller_state_cat", "customer_state_cat"]
-print("\nNaN check:", logistics[cat_cols].isna().sum().to_dict())
+print("\nNaN check:", logistics_for_strat[cat_cols].isna().sum().to_dict())
+
+categoricals = ["order_status", "product_category_name", "seller_state", "customer_state"]
+print(logistics_for_strat[categoricals].value_counts())
 
 def create_multiple_splits(n_splits, test_size, random_state, category):
     strat_train_set, strat_test_set = train_test_split(
-        logistics, test_size=test_size, stratify=logistics[category], random_state=random_state
+        logistics_for_strat, test_size=test_size, stratify=logistics_for_strat[category], random_state=random_state
     )
     print(strat_test_set[category].value_counts() / len(strat_test_set))
     return strat_train_set, strat_test_set
@@ -162,18 +180,19 @@ def create_multiple_splits(n_splits, test_size, random_state, category):
 splits = {}
 for cat in cat_cols:
     print(f"\n=== {cat} ===")
-    train, test = create_multiple_splits(
+    strat_train, strat_test = create_multiple_splits(
         n_splits=10, test_size=0.2, random_state=42, category=cat
     )
-    splits[cat] = {"train": train, "test": test}
+    splits[cat] = {"train": strat_train, "test": strat_test}
 
-logistics = test_set.copy()
-logistics["order_purchase_timestamp"] = pd.to_datetime(logistics["order_purchase_timestamp"])
-logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_estimated_delivery_date"])
-logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
-logistics = engineer_features(logistics)
+exploration = test_set.copy()
+exploration = exploration.dropna(subset=["product_weight_g", "freight_value", "price"])
+exploration["order_purchase_timestamp"] = pd.to_datetime(exploration["order_purchase_timestamp"])
+exploration["order_estimated_delivery_date"] = pd.to_datetime(exploration["order_estimated_delivery_date"])
+exploration["estimated_delivery_days"] = (exploration["order_estimated_delivery_date"] - exploration["order_purchase_timestamp"]).dt.days
+exploration = engineer_features(exploration, seller_volume_map, route_freq_map, is_train=False)
 
-corr_matrix = logistics.corr(numeric_only=True)
+corr_matrix = exploration.corr(numeric_only=True)
 print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
 
 attributes = [
@@ -184,20 +203,17 @@ attributes = [
     "estimated_delivery_days"
 ]
 
-scatter_matrix(logistics[attributes], figsize=(12, 8))
+scatter_matrix(exploration[attributes], figsize=(12, 8))
 #plt.show()
 
-logistics.plot(kind="scatter", x="real_distance_km", y="estimated_delivery_days",
-               alpha=0.1, grid=True)
+exploration.plot(kind="scatter", x="real_distance_km", y="estimated_delivery_days",
+                 alpha=0.1, grid=True)
 #plt.show()
 
 logistics = train_set.drop("estimated_delivery_days", axis=1)
 logistics_labels = train_set["estimated_delivery_days"].copy()
 
-logistics["order_purchase_timestamp"] = pd.to_datetime(logistics["order_purchase_timestamp"])
-logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_estimated_delivery_date"])
-logistics["estimated_delivery_days"] = (logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]).dt.days
-logistics = engineer_features(logistics)
+logistics = engineer_features(logistics, is_train=True)
 
 imputer = SimpleImputer(strategy="median")
 
@@ -248,10 +264,10 @@ num_attribs = ["real_distance_km", "seller_customer_lng_diff", "seller_customer_
                "seller_state_cat", "freight_per_km", "price_per_km",
                "distance_bucket", "same_state", "route_frequency",
                "same_region", "distance_weight", "state_pair_cat",
-               "purchase_month", "quarter", "distance_weight",
-               "product_density", "freight_per_weight", "max_dimension_cm",
-               "oversized_flag", "seller_order_volume", "is_weekend_purchase",
-               "end_of_month", "purchase_dayofweek"]
+               "purchase_month", "quarter", "product_density",
+               "freight_per_weight", "max_dimension_cm", "oversized_flag",
+               "seller_order_volume", "is_weekend_purchase", "end_of_month",
+               "purchase_dayofweek"]
 
 cat_attribs = ["seller_state", "customer_state", "product_category_name",
                "seller_region", "customer_region"]
