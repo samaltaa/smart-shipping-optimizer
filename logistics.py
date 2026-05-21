@@ -51,7 +51,9 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1-a))
 
 
-def engineer_features(df, seller_volume_map=None, route_freq_map=None, is_train=True):
+def engineer_features(df, seller_volume_map, route_freq_map,
+                      state_pair_avg_map, customer_state_avg_map,
+                      seller_state_avg_map, is_train=True):
     df = df.copy()
 
     df["seller_state_cat"] = df["seller_state"].astype("category").cat.codes
@@ -72,11 +74,6 @@ def engineer_features(df, seller_volume_map=None, route_freq_map=None, is_train=
     df["freight_per_weight"] = df["freight_value"] / df["product_weight_g"].replace(0, np.nan)
     df["max_dimension_cm"] = df[["product_length_cm", "product_height_cm", "product_width_cm"]].max(axis=1)
     df["oversized_flag"] = (df["max_dimension_cm"] > 100).astype(int)
-    df["distance_bucket"] = pd.cut(
-        df["real_distance_km"],
-        bins=[0, 50, 200, 1000, 10000],
-        labels=[0, 1, 2, 3]
-    ).astype(float)
     df["same_state"] = (df["seller_state"] == df["customer_state"]).astype(int)
     df["state_pair"] = df["seller_state"] + "_" + df["customer_state"]
     df["state_pair_cat"] = df["state_pair"].astype("category").cat.codes
@@ -88,6 +85,15 @@ def engineer_features(df, seller_volume_map=None, route_freq_map=None, is_train=
     df["seller_region"] = df["seller_state"].map(brazil_regions)
     df["customer_region"] = df["customer_state"].map(brazil_regions)
     df["same_region"] = (df["seller_region"] == df["customer_region"]).astype(int)
+    df["log_distance"] = np.log1p(df["real_distance_km"])
+    df["log_freight"] = np.log1p(df["freight_value"])
+    df["log_weight"] = np.log1p(df["product_weight_g"])
+    df["log_volume"] = np.log1p(df["product_volume"])
+    df["local_heavy"] = (
+        (df["same_state"] == 1) &
+        (df["product_weight_g"] > 5000)
+    ).astype(int)
+    df["volume_distance_interaction"] = df["product_volume"] * df["real_distance_km"]
 
     if is_train:
         df["seller_order_volume"] = df.groupby("seller_id")["order_id"].transform("count")
@@ -95,6 +101,10 @@ def engineer_features(df, seller_volume_map=None, route_freq_map=None, is_train=
     else:
         df["seller_order_volume"] = df["seller_id"].map(seller_volume_map).fillna(0)
         df["route_frequency"] = df["state_pair"].map(route_freq_map).fillna(0)
+
+    df["state_pair_avg_days"] = df["state_pair"].map(state_pair_avg_map).fillna(state_pair_avg_map.mean())
+    df["customer_state_avg_days"] = df["customer_state"].map(customer_state_avg_map).fillna(customer_state_avg_map.mean())
+    df["seller_state_avg_days"] = df["seller_state"].map(seller_state_avg_map).fillna(seller_state_avg_map.mean())
 
     return df
 
@@ -140,6 +150,9 @@ train_set["state_pair"] = train_set["seller_state"] + "_" + train_set["customer_
 
 seller_volume_map = train_set.groupby("seller_id")["order_id"].count()
 route_freq_map = train_set.groupby("state_pair")["order_id"].count()
+state_pair_avg_map = train_set.groupby("state_pair")["estimated_delivery_days"].mean()
+customer_state_avg_map = train_set.groupby("customer_state")["estimated_delivery_days"].mean()
+seller_state_avg_map = train_set.groupby("seller_state")["estimated_delivery_days"].mean()
 
 logistics_for_strat = train_set.copy()
 
@@ -190,7 +203,11 @@ exploration = exploration.dropna(subset=["product_weight_g", "freight_value", "p
 exploration["order_purchase_timestamp"] = pd.to_datetime(exploration["order_purchase_timestamp"])
 exploration["order_estimated_delivery_date"] = pd.to_datetime(exploration["order_estimated_delivery_date"])
 exploration["estimated_delivery_days"] = (exploration["order_estimated_delivery_date"] - exploration["order_purchase_timestamp"]).dt.days
-exploration = engineer_features(exploration, seller_volume_map, route_freq_map, is_train=False)
+exploration = engineer_features(
+    exploration, seller_volume_map, route_freq_map,
+    state_pair_avg_map, customer_state_avg_map, seller_state_avg_map,
+    is_train=False
+)
 
 corr_matrix = exploration.corr(numeric_only=True)
 print(corr_matrix["estimated_delivery_days"].sort_values(ascending=False))
@@ -213,7 +230,11 @@ exploration.plot(kind="scatter", x="real_distance_km", y="estimated_delivery_day
 logistics = train_set.drop("estimated_delivery_days", axis=1)
 logistics_labels = train_set["estimated_delivery_days"].copy()
 
-logistics = engineer_features(logistics, is_train=True)
+logistics = engineer_features(
+    logistics, seller_volume_map, route_freq_map,
+    state_pair_avg_map, customer_state_avg_map, seller_state_avg_map,
+    is_train=True
+)
 
 imputer = SimpleImputer(strategy="median")
 
@@ -262,12 +283,14 @@ num_attribs = ["real_distance_km", "seller_customer_lng_diff", "seller_customer_
                "freight_value", "seller_zip_code_prefix", "freight_ratio",
                "product_weight_g", "product_volume", "customer_state_cat",
                "seller_state_cat", "freight_per_km", "price_per_km",
-               "distance_bucket", "same_state", "route_frequency",
-               "same_region", "distance_weight", "state_pair_cat",
-               "purchase_month", "quarter", "product_density",
-               "freight_per_weight", "max_dimension_cm", "oversized_flag",
-               "seller_order_volume", "is_weekend_purchase", "end_of_month",
-               "purchase_dayofweek"]
+               "same_state", "route_frequency", "same_region",
+               "distance_weight", "state_pair_cat", "purchase_month",
+               "quarter", "product_density", "freight_per_weight",
+               "max_dimension_cm", "oversized_flag", "seller_order_volume",
+               "is_weekend_purchase", "end_of_month", "purchase_dayofweek",
+               "log_distance", "log_freight", "log_weight", "log_volume",
+               "local_heavy", "volume_distance_interaction",
+               "state_pair_avg_days", "customer_state_avg_days", "seller_state_avg_days"]
 
 cat_attribs = ["seller_state", "customer_state", "product_category_name",
                "seller_region", "customer_region"]
