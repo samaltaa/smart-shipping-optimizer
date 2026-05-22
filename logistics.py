@@ -29,7 +29,8 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import cross_val_score, GridSearchCV, RandomizedSearchCV
 from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import randint
-
+from xgboost import XGBRegressor
+from sklearn.ensemble import GradientBoostingRegressor, ExtraTreesRegressor
 
 brazil_regions = {
     "AC": "North", "AP": "North", "AM": "North", "PA": "North",
@@ -53,12 +54,14 @@ def haversine(lat1, lon1, lat2, lon2):
 
 def engineer_features(df, seller_volume_map, route_freq_map,
                       state_pair_avg_map, customer_state_avg_map,
-                      seller_state_avg_map, is_train=True):
+                      seller_state_avg_map, route_variability_map,
+                      is_train=True):
     df = df.copy()
 
     df["seller_state_cat"] = df["seller_state"].astype("category").cat.codes
     df["customer_state_cat"] = df["customer_state"].astype("category").cat.codes
     df["zip_distance"] = abs(df["customer_zip_code_prefix"] - df["seller_zip_code_prefix"])
+    df["customer_zip_prefix_bin"] = df["customer_zip_code_prefix"] // 10000
     df["product_volume"] = df["product_length_cm"] * df["product_height_cm"] * df["product_width_cm"]
     df["freight_ratio"] = df["freight_value"] / df["price"].replace(0, np.nan)
     df["real_distance_km"] = df.apply(
@@ -69,31 +72,42 @@ def engineer_features(df, seller_volume_map, route_freq_map,
     df["seller_customer_lng_diff"] = abs(df["customer_lng"] - df["seller_lng"])
     df["freight_per_km"] = df["freight_value"] / df["real_distance_km"].replace(0, np.nan)
     df["price_per_km"] = df["price"] / df["real_distance_km"].replace(0, np.nan)
-    df["distance_weight"] = df["real_distance_km"] * df["product_weight_g"]
-    df["product_density"] = df["product_weight_g"] / df["product_volume"].replace(0, np.nan)
     df["freight_per_weight"] = df["freight_value"] / df["product_weight_g"].replace(0, np.nan)
     df["max_dimension_cm"] = df[["product_length_cm", "product_height_cm", "product_width_cm"]].max(axis=1)
-    df["oversized_flag"] = (df["max_dimension_cm"] > 100).astype(int)
     df["same_state"] = (df["seller_state"] == df["customer_state"]).astype(int)
     df["state_pair"] = df["seller_state"] + "_" + df["customer_state"]
     df["state_pair_cat"] = df["state_pair"].astype("category").cat.codes
     df["purchase_month"] = df["order_purchase_timestamp"].dt.month
     df["purchase_dayofweek"] = df["order_purchase_timestamp"].dt.dayofweek
-    df["is_weekend_purchase"] = (df["purchase_dayofweek"] >= 5).astype(int)
     df["quarter"] = df["order_purchase_timestamp"].dt.quarter
-    df["end_of_month"] = (df["order_purchase_timestamp"].dt.day >= 25).astype(int)
     df["seller_region"] = df["seller_state"].map(brazil_regions)
     df["customer_region"] = df["customer_state"].map(brazil_regions)
-    df["same_region"] = (df["seller_region"] == df["customer_region"]).astype(int)
     df["log_distance"] = np.log1p(df["real_distance_km"])
     df["log_freight"] = np.log1p(df["freight_value"])
     df["log_weight"] = np.log1p(df["product_weight_g"])
     df["log_volume"] = np.log1p(df["product_volume"])
-    df["local_heavy"] = (
-        (df["same_state"] == 1) &
-        (df["product_weight_g"] > 5000)
+    df["local_heavy"] = ((df["same_state"] == 1) & (df["product_weight_g"] > 5000)).astype(int)
+    df["heavy_item_flag"] = (df["product_weight_g"] > 5000).astype(int)
+    df["extreme_longhaul_flag"] = (df["real_distance_km"] > 1450).astype(int)
+    df["long_heavy"] = ((df["real_distance_km"] > 500) & (df["product_weight_g"] > 2000)).astype(int)
+    df["short_heavy"] = ((df["real_distance_km"] < 200) & (df["product_weight_g"] > 5000)).astype(int)
+    df["ultra_cheap_freight"] = (df["freight_value"] < 10).astype(int)
+    df["freight_tier"] = pd.cut(
+        df["freight_value"],
+        bins=[0, 10, 20, 50, np.inf],
+        labels=[0, 1, 2, 3]
+    ).astype(float)
+    df["holiday_pressure"] = df["purchase_month"].isin([1, 2, 6, 12]).astype(int)
+    df["fast_season"] = df["purchase_month"].isin([7, 8, 9]).astype(int)
+    df["north_involved"] = (
+        (df["seller_region"] == "North") |
+        (df["customer_region"] == "North")
     ).astype(int)
-    df["volume_distance_interaction"] = df["product_volume"] * df["real_distance_km"]
+    df["remote_state_flag"] = (df["customer_region"] == "North").astype(int)
+    df["seller_remote_flag"] = df["seller_state"].isin(
+        ["AM", "RO", "PA", "AC", "RR", "AP", "TO"]
+    ).astype(int)
+    df["southeast_seller"] = (df["seller_region"] == "Southeast").astype(int)
 
     if is_train:
         df["seller_order_volume"] = df.groupby("seller_id")["order_id"].transform("count")
@@ -102,6 +116,11 @@ def engineer_features(df, seller_volume_map, route_freq_map,
         df["seller_order_volume"] = df["seller_id"].map(seller_volume_map).fillna(0)
         df["route_frequency"] = df["state_pair"].map(route_freq_map).fillna(0)
 
+    df["log_distance_route_ratio"] = np.log1p(
+        df["real_distance_km"] / df["route_frequency"].replace(0, np.nan)
+    )
+    df["rare_route_flag"] = (df["route_frequency"] < df["route_frequency"].quantile(0.25)).astype(int)
+    df["route_variability"] = df["state_pair"].map(route_variability_map).fillna(route_variability_map.mean())
     df["state_pair_avg_days"] = df["state_pair"].map(state_pair_avg_map).fillna(state_pair_avg_map.mean())
     df["customer_state_avg_days"] = df["customer_state"].map(customer_state_avg_map).fillna(customer_state_avg_map.mean())
     df["seller_state_avg_days"] = df["seller_state"].map(seller_state_avg_map).fillna(seller_state_avg_map.mean())
@@ -153,6 +172,7 @@ route_freq_map = train_set.groupby("state_pair")["order_id"].count()
 state_pair_avg_map = train_set.groupby("state_pair")["estimated_delivery_days"].mean()
 customer_state_avg_map = train_set.groupby("customer_state")["estimated_delivery_days"].mean()
 seller_state_avg_map = train_set.groupby("seller_state")["estimated_delivery_days"].mean()
+route_variability_map = train_set.groupby("state_pair")["estimated_delivery_days"].std()
 
 logistics_for_strat = train_set.copy()
 
@@ -206,7 +226,7 @@ exploration["estimated_delivery_days"] = (exploration["order_estimated_delivery_
 exploration = engineer_features(
     exploration, seller_volume_map, route_freq_map,
     state_pair_avg_map, customer_state_avg_map, seller_state_avg_map,
-    is_train=False
+    route_variability_map, is_train=False
 )
 
 corr_matrix = exploration.corr(numeric_only=True)
@@ -233,7 +253,7 @@ logistics_labels = train_set["estimated_delivery_days"].copy()
 logistics = engineer_features(
     logistics, seller_volume_map, route_freq_map,
     state_pair_avg_map, customer_state_avg_map, seller_state_avg_map,
-    is_train=True
+    route_variability_map, is_train=True
 )
 
 imputer = SimpleImputer(strategy="median")
@@ -278,19 +298,55 @@ num_pipeline = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
 logistics_num_prepared = num_pipeline.fit_transform(logistics_numerical_data_only)
 print(logistics_num_prepared[:2].round(2))
 
-num_attribs = ["real_distance_km", "seller_customer_lng_diff", "seller_customer_lat_diff",
-               "zip_distance", "customer_zip_code_prefix", "customer_lat",
-               "freight_value", "seller_zip_code_prefix", "freight_ratio",
-               "product_weight_g", "product_volume", "customer_state_cat",
-               "seller_state_cat", "freight_per_km", "price_per_km",
-               "same_state", "route_frequency", "same_region",
-               "distance_weight", "state_pair_cat", "purchase_month",
-               "quarter", "product_density", "freight_per_weight",
-               "max_dimension_cm", "oversized_flag", "seller_order_volume",
-               "is_weekend_purchase", "end_of_month", "purchase_dayofweek",
-               "log_distance", "log_freight", "log_weight", "log_volume",
-               "local_heavy", "volume_distance_interaction",
-               "state_pair_avg_days", "customer_state_avg_days", "seller_state_avg_days"]
+num_attribs = [
+    "real_distance_km",
+    "log_distance",
+    "seller_customer_lng_diff",
+    "seller_customer_lat_diff",
+    "zip_distance",
+    "customer_zip_code_prefix",
+    "customer_zip_prefix_bin",
+    "customer_lat",
+    "freight_value",
+    "log_freight",
+    "freight_tier",
+    "ultra_cheap_freight",
+    "seller_zip_code_prefix",
+    "freight_ratio",
+    "freight_per_km",
+    "freight_per_weight",
+    "product_weight_g",
+    "log_weight",
+    "product_volume",
+    "log_volume",
+    "max_dimension_cm",
+    "customer_state_cat",
+    "seller_state_cat",
+    "price_per_km",
+    "same_state",
+    "north_involved",
+    "remote_state_flag",
+    "seller_remote_flag",
+    "southeast_seller",
+    "route_frequency",
+    "rare_route_flag",
+    "route_variability",
+    "log_distance_route_ratio",
+    "state_pair_cat",
+    "state_pair_avg_days",
+    "customer_state_avg_days",
+    "seller_state_avg_days",
+    "purchase_month",
+    "purchase_dayofweek",
+    "quarter",
+    "holiday_pressure",
+    "fast_season",
+    "extreme_longhaul_flag",
+    "long_heavy",
+    "short_heavy",
+    "local_heavy",
+    "heavy_item_flag"
+]
 
 cat_attribs = ["seller_state", "customer_state", "product_category_name",
                "seller_region", "customer_region"]
@@ -306,38 +362,65 @@ def make_preprocessing():
         ("cat", cat_pipeline, cat_attribs)
     ])
 
-lin_reg = make_pipeline(make_preprocessing(), LinearRegression())
-lin_reg.fit(logistics, logistics_labels)
+gradient_boost_reg = make_pipeline(make_preprocessing(), GradientBoostingRegressor(
+    n_estimators=200,
+    learning_rate=0.1,
+    max_depth=5,
+    random_state=42
+))
+gradient_boost_reg.fit(logistics, logistics_labels)
 
-tree_reg = make_pipeline(make_preprocessing(), DecisionTreeRegressor(random_state=42))
-tree_reg.fit(logistics, logistics_labels)
+extra_trees_reg = make_pipeline(make_preprocessing(), ExtraTreesRegressor(
+    n_estimators=200,
+    random_state=42,
+    n_jobs=-1
+))
+extra_trees_reg.fit(logistics, logistics_labels)
 
-print("Linear Regression:")
-lin_scores = -cross_val_score(lin_reg, logistics, logistics_labels,
+print("Gradient Boosting:")
+gb_scores = -cross_val_score(gradient_boost_reg, logistics, logistics_labels,
                               scoring="neg_root_mean_squared_error", cv=10)
-print(pd.Series(lin_scores).describe())
+print(pd.Series(gb_scores).describe())
 
-print("Decision Tree:")
-tree_scores = -cross_val_score(tree_reg, logistics, logistics_labels,
-                               scoring="neg_root_mean_squared_error", cv=10)
-print(pd.Series(tree_scores).describe())
+print("Extra Trees:")
+et_scores = -cross_val_score(extra_trees_reg, logistics, logistics_labels,
+                              scoring="neg_root_mean_squared_error", cv=10)
+print(pd.Series(et_scores).describe())
 
-forest_reg = make_pipeline(make_preprocessing(), RandomForestRegressor(random_state=42, n_jobs=-1))
+print("XGBoost baseline:")
+xgb_reg = make_pipeline(make_preprocessing(), XGBRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=3, #change to 6 after first iteration
+    subsample=0.8, #change 0.4
+    colsample_bytree=0.8,
+    min_child_weight=3,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    random_state=42,
+    n_jobs=-1,
+    tree_method="hist"
+))
+xgb_reg.fit(logistics, logistics_labels)
+xgb_scores = -cross_val_score(xgb_reg, logistics, logistics_labels,
+                              scoring="neg_root_mean_squared_error", cv=10)
+print(pd.Series(xgb_scores).describe())
 
-n_features = len(num_attribs) + len(cat_attribs)
-n_samples = len(logistics)
-
-param_distribs = {
-    "randomforestregressor__n_estimators": randint(200, 1000),
-    "randomforestregressor__max_depth": [20, 30, 50, None],
-    "randomforestregressor__min_samples_split": randint(2, max(2, int(np.sqrt(n_samples) / 10))),
-    "randomforestregressor__min_samples_leaf": randint(1, 5),
-    "randomforestregressor__max_features": ["sqrt", "log2", 0.3, 0.5]
+xgb_param_distribs = {
+    "xgbregressor__n_estimators": randint(300, 1000),
+    "xgbregressor__learning_rate": [0.01, 0.05, 0.1, 0.2],
+    "xgbregressor__max_depth": randint(3, 4, 10),
+    "xgbregressor__subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+    "xgbregressor__colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+    "xgbregressor__min_child_weight": randint(1, 10),
+    "xgbregressor__gamma": [0, 0.1, 0.2, 0.5],
+    "xgbregressor__reg_alpha": [0, 0.1, 0.5, 1.0],
+    "xgbregressor__reg_lambda": [0.5, 1.0, 1.5, 2.0]
 }
 
-rnd_search = RandomizedSearchCV(
-    forest_reg,
-    param_distribs,
+xgb_search = RandomizedSearchCV(
+    xgb_reg,
+    xgb_param_distribs,
     n_iter=100,
     cv=10,
     scoring="neg_root_mean_squared_error",
@@ -348,19 +431,19 @@ rnd_search = RandomizedSearchCV(
     error_score="raise"
 )
 
-rnd_search.fit(logistics, logistics_labels)
+xgb_search.fit(logistics, logistics_labels)
 
-print(f"\nBest RMSE: {-rnd_search.best_score_:.4f} days")
-print(f"\nBest params:\n{rnd_search.best_params_}")
+print(f"\nXGBoost Best RMSE: {-xgb_search.best_score_:.4f} days")
+print(f"\nXGBoost Best params:\n{xgb_search.best_params_}")
 
-cv_results = pd.DataFrame(rnd_search.cv_results_)
-print("\nTop 10 combinations:")
-print(cv_results[[
-    "param_randomforestregressor__n_estimators",
-    "param_randomforestregressor__max_depth",
-    "param_randomforestregressor__max_features",
-    "param_randomforestregressor__min_samples_split",
-    "param_randomforestregressor__min_samples_leaf",
+xgb_cv_results = pd.DataFrame(xgb_search.cv_results_)
+print("\nTop 10 XGBoost combinations:")
+print(xgb_cv_results[[
+    "param_xgbregressor__n_estimators",
+    "param_xgbregressor__learning_rate",
+    "param_xgbregressor__max_depth",
+    "param_xgbregressor__subsample",
+    "param_xgbregressor__colsample_bytree",
     "mean_test_score",
     "mean_train_score",
     "std_test_score"
