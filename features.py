@@ -99,3 +99,58 @@ logistics["holiday_window"] = pd.cut(
     bins=[0, 3, 7, 14, 30, 60, 365],
     labels=[0, 1, 2, 3, 4, 5]
 ).astype(float)
+
+logistics["seller_hub_distance"] = logistics.apply(
+    lambda row: haversine(row["seller_lat"], row["seller_lng"], -23.5505, -46.6333), axis=1
+)
+logistics["seller_customer_state_reach"] = logistics["seller_id"].map(
+    logistics.groupby("seller_id")["customer_state"].nunique()
+)
+logistics["seller_price_range"] = logistics["seller_id"].map(
+    logistics.groupby("seller_id")["price"].apply(lambda x: x.max() - x.min())
+)
+logistics["photos_vs_category_avg"] = (
+    logistics["product_photos_qty"] /
+    logistics["product_category_name"].map(
+        logistics.groupby("product_category_name")["product_photos_qty"].mean()
+    ).replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["order_item_diversity"] = logistics["order_id"].map(
+    logistics.groupby("order_id")["product_category_name"].nunique()
+)
+logistics["order_unique_sellers"] = logistics["order_id"].map(
+    logistics.groupby("order_id")["seller_id"].nunique()
+)
+logistics["max_item_price"] = logistics["order_id"].map(
+    logistics.groupby("order_id")["price"].max()
+)
+logistics["order_diversity_x_sellers"] = logistics["order_item_diversity"] * logistics["order_unique_sellers"]
+logistics["avg_installment_value"] = (
+    logistics["payment_value"] / logistics["payment_installments"].replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["weekend_purchase_x_installments"] = (
+    (logistics["purchase_dayofweek"] >= 5).astype(int) * logistics["payment_installments"]
+)
+logistics["payment_sequential_x_complexity"] = logistics["payment_sequential"] * logistics["category_complexity"]
+logistics["customer_city_seller_concentration"] = logistics["customer_city"].map(
+    logistics.groupby("customer_city")["seller_state"].nunique()
+).fillna(0)
+logistics["shipping_window_x_seller_review"] = (
+    logistics["shipping_limit_days"] * logistics["seller_avg_review"].fillna(3)
+).replace([np.inf, -np.inf], np.nan)
+logistics["seller_hub_distance_x_shipping_window"] = (
+    logistics["seller_hub_distance"] * logistics["shipping_limit_days"]
+).replace([np.inf, -np.inf], np.nan)
+logistics["seller_hub_distance_x_complexity"] = (
+    logistics["seller_hub_distance"] * logistics["category_complexity"]
+).replace([np.inf, -np.inf], np.nan)
+logistics["seller_hub_distance_x_review"] = (
+    logistics["seller_hub_distance"] * logistics["seller_avg_review"].fillna(3)
+).replace([np.inf, -np.inf], np.nan)
+logistics["seller_hub_distance_x_seller_age"] = (
+    logistics["seller_hub_distance"] * logistics["log_seller_age"]
+).replace([np.inf, -np.inf], np.nan)
+logistics["seller_reach_x_hub_distance"] = (
+    logistics["seller_customer_state_reach"] * logistics["seller_hub_distance"]
+).replace([np.inf, -np.inf], np.nan)
+

@@ -1,9 +1,16 @@
 from pathlib import Path
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from statsmodels.nonparametric.smoothers_lowess import lowess
+from math import radians, sin, cos, sqrt, atan2
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1-a))
 
 
 def load_data():
@@ -29,15 +36,11 @@ def load_data():
         payment_installments=("payment_installments", "max"),
         payment_type=("payment_type", lambda x: x.mode()[0]),
         payment_value=("payment_value", "sum"),
-        payment_sequential=("payment_sequential", "max"),
-        payment_type_count=("payment_type", "nunique")
+        payment_sequential=("payment_sequential", "max")
     ).reset_index()
     df = df.merge(payments_agg, on="order_id", how="left")
     reviews_agg = order_reviews.groupby("order_id").agg(
-        review_score=("review_score", "mean"),
-        review_comment_length=("review_comment_message", lambda x: x.dropna().str.len().mean()),
-        review_creation_date=("review_creation_date", "min"),
-        review_answer_timestamp=("review_answer_timestamp", "min")
+        review_score=("review_score", "mean")
     ).reset_index()
     df = df.merge(reviews_agg, on="order_id", how="left")
     return df
@@ -49,9 +52,6 @@ logistics["order_purchase_timestamp"] = pd.to_datetime(logistics["order_purchase
 logistics["order_estimated_delivery_date"] = pd.to_datetime(logistics["order_estimated_delivery_date"])
 logistics["order_approved_at"] = pd.to_datetime(logistics["order_approved_at"])
 logistics["shipping_limit_date"] = pd.to_datetime(logistics["shipping_limit_date"])
-logistics["order_delivered_customer_date"] = pd.to_datetime(logistics["order_delivered_customer_date"])
-logistics["review_creation_date"] = pd.to_datetime(logistics["review_creation_date"])
-logistics["review_answer_timestamp"] = pd.to_datetime(logistics["review_answer_timestamp"])
 
 logistics["estimated_delivery_days"] = (
     logistics["order_estimated_delivery_date"] - logistics["order_purchase_timestamp"]
@@ -66,8 +66,18 @@ logistics["product_volume"] = (
 logistics["purchase_hour"] = logistics["order_purchase_timestamp"].dt.hour
 logistics["purchase_dayofweek"] = logistics["order_purchase_timestamp"].dt.dayofweek
 logistics["purchase_month"] = logistics["order_purchase_timestamp"].dt.month
+logistics["purchase_week_of_year"] = logistics["order_purchase_timestamp"].dt.isocalendar().week.astype(int)
+logistics["purchase_quarter"] = logistics["order_purchase_timestamp"].dt.quarter
+logistics["purchase_date"] = logistics["order_purchase_timestamp"].dt.date
+
 logistics["payment_approval_delay"] = (
     logistics["order_approved_at"] - logistics["order_purchase_timestamp"]
+).dt.total_seconds() / 3600
+logistics["shipping_limit_days"] = (
+    logistics["shipping_limit_date"] - logistics["order_purchase_timestamp"]
+).dt.days
+logistics["seller_processing_window"] = (
+    logistics["shipping_limit_date"] - logistics["order_approved_at"]
 ).dt.total_seconds() / 3600
 
 category_complexity = {
@@ -81,223 +91,237 @@ category_complexity = {
 }
 logistics["category_complexity"] = logistics["product_category_name"].map(category_complexity).fillna(2)
 
+SP_LAT, SP_LNG = -23.5505, -46.6333
+logistics["real_distance_km"] = logistics.apply(
+    lambda row: haversine(row["seller_lat"], row["seller_lng"],
+                          row["customer_lat"], row["customer_lng"]), axis=1
+)
+logistics["seller_hub_distance"] = logistics.apply(
+    lambda row: haversine(row["seller_lat"], row["seller_lng"], SP_LAT, SP_LNG), axis=1
+)
+
+seller_avg_review = logistics.groupby("seller_id")["review_score"].mean()
+logistics["seller_avg_review"] = logistics["seller_id"].map(seller_avg_review).fillna(3.0)
+
+seller_tenure = logistics.groupby("seller_id")["order_purchase_timestamp"].min()
+logistics["seller_age_days"] = (
+    logistics["order_purchase_timestamp"] - logistics["seller_id"].map(seller_tenure)
+).dt.days
+logistics["log_seller_age"] = np.log1p(logistics["seller_age_days"])
+
+PLATFORM_LAUNCH = pd.Timestamp("2016-09-01")
+brazil_capitals = [
+    "sao paulo", "rio de janeiro", "brasilia", "salvador", "fortaleza",
+    "belo horizonte", "manaus", "curitiba", "recife", "porto alegre",
+    "belem", "goiania", "sao luis", "maceio", "natal", "teresina",
+    "campo grande", "joao pessoa", "aracaju", "porto velho", "macapa",
+    "florianopolis", "vitoria", "cuiaba", "palmas", "rio branco", "boa vista"
+]
+
+neighboring_states = {
+    "SP": ["RJ", "MG", "PR", "MS", "GO"],
+    "RJ": ["SP", "MG", "ES"],
+    "MG": ["SP", "RJ", "ES", "BA", "GO", "MS", "MT", "DF"],
+    "RS": ["SC", "PR"],
+    "SC": ["RS", "PR"],
+    "PR": ["SC", "RS", "SP", "MS"],
+    "BA": ["SE", "AL", "PE", "PI", "TO", "GO", "MG", "ES"],
+    "GO": ["MT", "MS", "MG", "BA", "TO", "DF"],
+    "AM": ["RR", "PA", "MT", "RO", "AC"],
+    "PA": ["AM", "RR", "AP", "MA", "TO", "MT"],
+}
+
+print("Engineering features...")
+
+logistics["seller_zip_prefix_bin"] = logistics["seller_zip_code_prefix"] // 10000
+
+logistics["seller_zip_to_customer_zip_ratio"] = (
+    logistics["seller_zip_code_prefix"] /
+    logistics["customer_zip_code_prefix"].replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+
+logistics["seller_in_capital_city"] = logistics["seller_city"].str.lower().isin(brazil_capitals).astype(int)
+logistics["customer_in_capital_city"] = logistics["customer_city"].str.lower().isin(brazil_capitals).astype(int)
+
+logistics["days_until_end_of_month"] = (
+    logistics["order_purchase_timestamp"].dt.days_in_month -
+    logistics["order_purchase_timestamp"].dt.day
+)
+logistics["purchase_week_of_year"] = logistics["purchase_week_of_year"]
+logistics["purchase_quarter_x_dayofweek"] = logistics["purchase_quarter"] * logistics["purchase_dayofweek"]
+logistics["days_since_platform_launch"] = (
+    logistics["order_purchase_timestamp"] - PLATFORM_LAUNCH
+).dt.days
+logistics["purchase_hour_bucket"] = pd.cut(
+    logistics["purchase_hour"],
+    bins=[-1, 8, 12, 18, 24],
+    labels=[0, 1, 2, 3]
+).astype(float)
+
+logistics["product_length_to_height_ratio"] = (
+    logistics["product_length_cm"] /
+    logistics["product_height_cm"].replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["product_weight_to_volume_ratio"] = (
+    logistics["product_weight_g"] /
+    logistics["product_volume"].replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["product_max_to_min_dimension_ratio"] = (
+    logistics[["product_length_cm", "product_height_cm", "product_width_cm"]].max(axis=1) /
+    logistics[["product_length_cm", "product_height_cm", "product_width_cm"]].min(axis=1).replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["product_surface_area"] = 2 * (
+    logistics["product_length_cm"] * logistics["product_height_cm"] +
+    logistics["product_length_cm"] * logistics["product_width_cm"] +
+    logistics["product_height_cm"] * logistics["product_width_cm"]
+)
+logistics["is_oversized"] = (
+    logistics[["product_length_cm", "product_height_cm", "product_width_cm"]].max(axis=1) > 100
+).astype(int)
+
+logistics["payment_value_per_item"] = (
+    logistics["payment_value"] /
+    logistics["order_id"].map(logistics.groupby("order_id")["order_item_id"].count()).replace(0, np.nan)
+).replace([np.inf, -np.inf], np.nan)
+logistics["is_single_payment"] = (logistics["payment_installments"] == 1).astype(int)
+logistics["payment_value_x_installments"] = logistics["payment_value"] * logistics["payment_installments"]
+logistics["installment_coverage_ratio"] = (
+    logistics["payment_installments"] /
+    pd.cut(logistics["price"], bins=5, labels=[1, 2, 3, 4, 5]).astype(float)
+).replace([np.inf, -np.inf], np.nan)
+
+seller_weekend_ratio = logistics.groupby("seller_id").apply(
+    lambda x: (x["purchase_dayofweek"] >= 5).mean()
+)
+logistics["seller_weekend_order_ratio"] = logistics["seller_id"].map(seller_weekend_ratio).fillna(0)
+
+seller_night_ratio = logistics.groupby("seller_id").apply(
+    lambda x: ((x["purchase_hour"] >= 0) & (x["purchase_hour"] < 8)).mean()
+)
+logistics["seller_night_order_ratio"] = logistics["seller_id"].map(seller_night_ratio).fillna(0)
+
+seller_approval_hour = logistics.groupby("seller_id")["order_approved_at"].apply(
+    lambda x: pd.to_datetime(x).dt.hour.mean()
+)
+logistics["seller_avg_approval_hour"] = logistics["seller_id"].map(seller_approval_hour).fillna(12)
+
+logistics["customer_zip_prefix_x_seller_state_cat"] = (
+    logistics["customer_zip_code_prefix"] // 10000 *
+    logistics["seller_state"].astype("category").cat.codes
+)
+
+logistics["category_x_purchase_month"] = (
+    logistics["category_complexity"] * logistics["purchase_month"]
+)
+logistics["category_x_seller_region"] = (
+    logistics["category_complexity"] *
+    logistics["seller_state"].astype("category").cat.codes
+)
+logistics["category_x_customer_region"] = (
+    logistics["category_complexity"] *
+    logistics["customer_state"].astype("category").cat.codes
+)
+
 order_agg = logistics.groupby("order_id").agg(
-    items_per_order=("order_item_id", "count"),
-    unique_sellers_per_order=("seller_id", "nunique"),
-    total_weight=("product_weight_g", "sum"),
-    total_volume=("product_volume", "sum"),
+    order_total_volume=("product_volume", "sum"),
+    order_max_dimension=("product_length_cm", "max"),
+    order_item_count=("order_item_id", "count"),
+    order_unique_sellers=("seller_id", "nunique"),
     order_total_price=("price", "sum")
 ).reset_index()
 logistics = logistics.merge(order_agg, on="order_id", how="left")
-
-seller_stats = logistics.groupby("seller_id").agg(
-    seller_avg_review=("review_score", "mean"),
-    seller_avg_order_value=("price", "mean"),
-    seller_total_orders=("order_id", "count"),
-    seller_review_volatility=("review_score", "std")
-).reset_index()
-logistics = logistics.merge(seller_stats, on="seller_id", how="left")
-
-seller_tenure = logistics.groupby("seller_id")["order_purchase_timestamp"].min().reset_index()
-seller_tenure.columns = ["seller_id", "seller_first_sale_date"]
-logistics = logistics.merge(seller_tenure, on="seller_id", how="left")
-logistics["seller_age_days"] = (
-    logistics["order_purchase_timestamp"] - logistics["seller_first_sale_date"]
-).dt.days
-
-customer_stats = logistics.groupby("customer_unique_id").agg(
-    customer_lifetime_value=("price", "sum"),
-).reset_index()
-logistics = logistics.merge(customer_stats, on="customer_unique_id", how="left")
-
-customer_city_density = logistics.groupby("customer_city")["order_id"].count().reset_index()
-customer_city_density.columns = ["customer_city", "customer_city_order_density"]
-logistics = logistics.merge(customer_city_density, on="customer_city", how="left")
-
-daily_orders = logistics.groupby(logistics["order_purchase_timestamp"].dt.date).size().reset_index()
-daily_orders.columns = ["purchase_date", "daily_order_count"]
-daily_orders["purchase_date"] = pd.to_datetime(daily_orders["purchase_date"])
-daily_orders = daily_orders.sort_values("purchase_date")
-daily_orders["rolling_7d_orders"] = daily_orders["daily_order_count"].rolling(7).mean()
-logistics["purchase_date"] = pd.to_datetime(logistics["order_purchase_timestamp"].dt.date)
-logistics = logistics.merge(daily_orders[["purchase_date", "daily_order_count", "rolling_7d_orders"]], on="purchase_date", how="left")
-
-logistics["shipping_limit_days"] = (
-    logistics["shipping_limit_date"] - logistics["order_purchase_timestamp"]
-).dt.days
-logistics["seller_processing_window"] = (
-    logistics["shipping_limit_date"] - logistics["order_approved_at"]
-).dt.total_seconds() / 3600
-logistics["shipping_window_x_complexity"] = (
-    logistics["shipping_limit_days"] * logistics["category_complexity"]
-)
-logistics["log_city_density"] = np.log1p(logistics["customer_city_order_density"])
-logistics["log_seller_age"] = np.log1p(logistics["seller_age_days"])
-logistics["log_review_comment"] = np.log1p(logistics["review_comment_length"].fillna(0))
-logistics["log_clv"] = np.log1p(logistics["customer_lifetime_value"])
-logistics["log_total_weight"] = np.log1p(logistics["total_weight"])
-logistics["log_approval_delay"] = np.log1p(
-    logistics["payment_approval_delay"].replace([np.inf, -np.inf], np.nan)
-)
-logistics["log_installments"] = np.log1p(logistics["payment_installments"])
-logistics["log_rolling_7d"] = np.log1p(logistics["rolling_7d_orders"])
-
-logistics["clv_x_complexity"] = logistics["log_clv"] * logistics["category_complexity"]
-logistics["freight_burden"] = (
-    logistics["freight_value"] / logistics["price"].replace(0, np.nan)
-).replace([np.inf, -np.inf], np.nan) * logistics["log_total_weight"]
-logistics["complex_heavy_order"] = logistics["category_complexity"] * logistics["log_total_weight"]
-logistics["operational_stress"] = (
-    logistics["log_approval_delay"].fillna(0) +
-    logistics["unique_sellers_per_order"].fillna(1) +
-    logistics["log_installments"].fillna(0)
-)
-logistics["weight_x_sellers"] = logistics["log_total_weight"] * logistics["unique_sellers_per_order"]
-logistics["pressure_x_weight_sellers"] = (
-    logistics["rolling_7d_orders"] * logistics["weight_x_sellers"]
+logistics["items_per_seller"] = (
+    logistics["order_item_count"] /
+    logistics["order_unique_sellers"].replace(0, np.nan)
 ).replace([np.inf, -np.inf], np.nan)
-logistics["installment_approval_lag"] = (
-    logistics["payment_installments"] *
-    logistics["log_approval_delay"].replace([np.inf, -np.inf], np.nan)
+logistics["order_price_x_unique_sellers"] = logistics["order_total_price"] * logistics["order_unique_sellers"]
+logistics["order_total_price_x_installments"] = logistics["order_total_price"] * logistics["payment_installments"]
+
+state_pair_freq = logistics.groupby(["seller_state", "customer_state"]).size()
+logistics["seller_customer_state_pair_frequency"] = logistics.set_index(
+    ["seller_state", "customer_state"]
+).index.map(state_pair_freq).values
+
+logistics["is_same_city"] = (
+    logistics["seller_city"].str.lower() == logistics["customer_city"].str.lower()
+).astype(int)
+
+logistics["is_neighboring_state"] = logistics.apply(
+    lambda row: int(row["customer_state"] in neighboring_states.get(row["seller_state"], [])), axis=1
 )
-logistics["pressure_x_operational_stress"] = (
-    logistics["daily_order_count"] * logistics["operational_stress"]
-).replace([np.inf, -np.inf], np.nan)
-logistics["high_complexity_installment"] = (
-    logistics["category_complexity"] * logistics["payment_installments"]
-)
-logistics["seller_high_installment_rate"] = logistics["seller_id"].map(
-    logistics.groupby("seller_id")["payment_installments"].apply(lambda x: (x > 3).mean())
-).fillna(0)
-logistics["payment_value_vs_order_value"] = (
-    logistics["payment_value"] / logistics["order_total_price"].replace(0, np.nan)
-).replace([np.inf, -np.inf], np.nan)
 
+logistics["seller_to_customer_direction"] = np.sign(
+    logistics["customer_lat"] - logistics["seller_lat"]
+) * 2 + np.sign(logistics["customer_lng"] - logistics["seller_lng"])
 
-combinations = {
-    "shipping_window_x_city_density": (
-        logistics["shipping_window_x_complexity"] *
-        logistics["log_city_density"]
-    ).replace([np.inf, -np.inf], np.nan),
+logistics["log_surface_area"] = np.log1p(logistics["product_surface_area"])
+logistics["log_days_since_launch"] = np.log1p(logistics["days_since_platform_launch"])
+logistics["log_payment_value_x_installments"] = np.log1p(logistics["payment_value_x_installments"])
+logistics["log_order_total_volume"] = np.log1p(logistics["order_total_volume"])
 
-    "processing_window_x_complexity": (
-        logistics["seller_processing_window"] *
-        logistics["category_complexity"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "shipping_window_x_seller_age": (
-        logistics["shipping_limit_days"] *
-        logistics["log_seller_age"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "city_density_x_clv": (
-        logistics["log_city_density"] *
-        logistics["log_clv"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "processing_window_x_weight": (
-        logistics["seller_processing_window"] *
-        logistics["log_total_weight"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "shipping_window_x_operational_stress": (
-        logistics["shipping_limit_days"] *
-        logistics["operational_stress"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "city_density_x_weight_sellers": (
-        logistics["log_city_density"] *
-        logistics["weight_x_sellers"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "seller_age_x_complexity": (
-        logistics["log_seller_age"] *
-        logistics["category_complexity"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "processing_window_x_installments": (
-        logistics["seller_processing_window"] *
-        logistics["log_installments"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "city_density_x_freight_burden": (
-        logistics["log_city_density"] *
-        logistics["freight_burden"].replace([np.inf, -np.inf], np.nan)
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "shipping_window_x_clv": (
-        logistics["shipping_window_x_complexity"] *
-        logistics["log_clv"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "load_x_shipping_window": (
-        logistics["log_rolling_7d"] *
-        logistics["shipping_limit_days"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "seller_age_x_review_volatility": (
-        logistics["log_seller_age"] *
-        logistics["seller_review_volatility"].fillna(0)
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "city_density_x_operational_stress": (
-        logistics["log_city_density"] *
-        logistics["operational_stress"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "processing_window_x_clv_complexity": (
-        logistics["seller_processing_window"] *
-        logistics["clv_x_complexity"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "shipping_window_x_installment_lag": (
-        logistics["shipping_limit_days"] *
-        logistics["installment_approval_lag"].replace([np.inf, -np.inf], np.nan)
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "city_density_x_seller_age": (
-        logistics["log_city_density"] *
-        logistics["log_seller_age"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "processing_window_x_seller_age": (
-        logistics["seller_processing_window"] *
-        logistics["log_seller_age"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "high_installment_x_shipping_window": (
-        logistics["high_complexity_installment"] *
-        logistics["shipping_limit_days"]
-    ).replace([np.inf, -np.inf], np.nan),
-
-    "payment_complexity_x_processing": (
-        logistics["payment_value_vs_order_value"].replace([np.inf, -np.inf], np.nan) *
-        logistics["seller_processing_window"]
-    ).replace([np.inf, -np.inf], np.nan),
+features = {
+    "seller_zip_prefix_bin": logistics["seller_zip_prefix_bin"],
+    "seller_zip_to_customer_zip_ratio": logistics["seller_zip_to_customer_zip_ratio"],
+    "seller_in_capital_city": logistics["seller_in_capital_city"],
+    "customer_in_capital_city": logistics["customer_in_capital_city"],
+    "days_until_end_of_month": logistics["days_until_end_of_month"],
+    "purchase_week_of_year": logistics["purchase_week_of_year"],
+    "purchase_quarter_x_dayofweek": logistics["purchase_quarter_x_dayofweek"],
+    "days_since_platform_launch": logistics["days_since_platform_launch"],
+    "log_days_since_launch": logistics["log_days_since_launch"],
+    "purchase_hour_bucket": logistics["purchase_hour_bucket"],
+    "product_length_to_height_ratio": logistics["product_length_to_height_ratio"],
+    "product_weight_to_volume_ratio": logistics["product_weight_to_volume_ratio"],
+    "product_max_to_min_dimension_ratio": logistics["product_max_to_min_dimension_ratio"],
+    "product_surface_area": logistics["product_surface_area"],
+    "log_surface_area": logistics["log_surface_area"],
+    "is_oversized": logistics["is_oversized"],
+    "payment_value_per_item": logistics["payment_value_per_item"],
+    "is_single_payment": logistics["is_single_payment"],
+    "payment_value_x_installments": logistics["payment_value_x_installments"],
+    "log_payment_value_x_installments": logistics["log_payment_value_x_installments"],
+    "installment_coverage_ratio": logistics["installment_coverage_ratio"],
+    "seller_weekend_order_ratio": logistics["seller_weekend_order_ratio"],
+    "seller_night_order_ratio": logistics["seller_night_order_ratio"],
+    "seller_avg_approval_hour": logistics["seller_avg_approval_hour"],
+    "customer_zip_prefix_x_seller_state_cat": logistics["customer_zip_prefix_x_seller_state_cat"],
+    "category_x_purchase_month": logistics["category_x_purchase_month"],
+    "category_x_seller_region": logistics["category_x_seller_region"],
+    "category_x_customer_region": logistics["category_x_customer_region"],
+    "order_total_volume": logistics["order_total_volume"],
+    "log_order_total_volume": logistics["log_order_total_volume"],
+    "order_max_dimension": logistics["order_max_dimension"],
+    "items_per_seller": logistics["items_per_seller"],
+    "order_price_x_unique_sellers": logistics["order_price_x_unique_sellers"],
+    "order_total_price_x_installments": logistics["order_total_price_x_installments"],
+    "log_order_total_price_x_installments": logistics["log_payment_value_x_installments"],
+    "seller_customer_state_pair_frequency": logistics["seller_customer_state_pair_frequency"],
+    "is_same_city": logistics["is_same_city"],
+    "is_neighboring_state": logistics["is_neighboring_state"],
+    "seller_to_customer_direction": logistics["seller_to_customer_direction"],
 }
 
-print("=" * 60)
-print("CROSS-ROUND COMBINATION CORRELATIONS")
+print("\n" + "=" * 60)
+print("CORRELATION SUMMARY")
 print("=" * 60)
 print(f"\n{'Feature':<45} {'Pearson r':>10} {'Keep?':>8}")
 print("-" * 65)
 
 results = {}
-for feat, series in combinations.items():
+for feat, series in features.items():
     clean = series.replace([np.inf, -np.inf], np.nan).dropna()
     corr = clean.corr(logistics.loc[clean.index, "estimated_delivery_days"])
     results[feat] = corr
-    keep = "YES" if abs(corr) > 0.05 else "WEAK"
+    keep = "YES" if abs(corr) > 0.03 else "WEAK"
     print(f"{feat:<45} {corr:>10.4f} {keep:>8}")
 
 print("\n" + "=" * 60)
-print("QUINTILE BREAKDOWN")
+print("QUINTILE BREAKDOWN — FEATURES ABOVE 0.03")
 print("=" * 60)
 
 for feat, corr in sorted(results.items(), key=lambda x: abs(x[1]), reverse=True):
-    if abs(corr) < 0.05:
+    if abs(corr) < 0.03:
         continue
-    logistics[feat] = combinations[feat]
     clean = logistics[[feat, "estimated_delivery_days"]].replace([np.inf, -np.inf], np.nan).dropna()
     if len(clean) < 100:
         continue
@@ -308,73 +332,10 @@ for feat, corr in sorted(results.items(), key=lambda x: abs(x[1]), reverse=True)
         print(f"\n=== {feat} (r={corr:.4f}, spread={spread:.2f} days) ===")
         print(quintile_stats.to_string())
     except Exception:
-        print(f"\n=== {feat} (r={corr:.4f}) === insufficient bins")
-
-fig, axes = plt.subplots(4, 5, figsize=(28, 22))
-axes = axes.flatten()
-
-for i, (feat, corr) in enumerate(sorted(results.items(), key=lambda x: abs(x[1]), reverse=True)):
-    if i >= 20:
-        break
-    series = combinations[feat]
-    clean = pd.DataFrame({"feat": series, "target": logistics["estimated_delivery_days"]}).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(clean) < 100:
-        continue
-    sample = clean.sample(min(8000, len(clean)), random_state=42)
-    clipped = sample["feat"].clip(lower=sample["feat"].quantile(0.01), upper=sample["feat"].quantile(0.99))
-    axes[i].scatter(clipped, sample["target"], alpha=0.05, s=5, color="steelblue")
-    try:
-        smoothed = lowess(sample["target"], clipped, frac=0.2)
-        axes[i].plot(smoothed[:, 0], smoothed[:, 1], color="red", linewidth=2)
-    except Exception:
-        pass
-    axes[i].set_title(f"{feat[:30]}\nr={corr:.4f}", fontsize=7)
-    axes[i].set_xlabel(feat[:25], fontsize=6)
-    axes[i].set_ylabel("Days", fontsize=7)
-
-plt.suptitle("Cross-Round Combinations vs Delivery Days", fontsize=13)
-plt.tight_layout()
-plt.show()
-
-strong = {k: v for k, v in results.items() if abs(v) > 0.05}
-for feat, corr in sorted(strong.items(), key=lambda x: abs(x[1]), reverse=True):
-    logistics[feat] = combinations[feat]
-    clean = logistics[[feat, "estimated_delivery_days"]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(clean) < 100:
-        continue
-    sample = clean.sample(min(10000, len(clean)), random_state=42)
-    clipped = sample[feat].clip(lower=sample[feat].quantile(0.01), upper=sample[feat].quantile(0.99))
-
-    try:
-        bins = pd.qcut(clean[feat], 5, duplicates="drop")
-        quintile_means = clean.groupby(bins, observed=True)["estimated_delivery_days"].mean()
-        spread = quintile_means.max() - quintile_means.min()
-    except Exception:
-        spread = 0.0
-        quintile_means = pd.Series()
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    axes[0].hexbin(clipped, sample["estimated_delivery_days"], gridsize=40, cmap="viridis", bins="log")
-    axes[0].set_title(f"Hexbin: {feat[:35]}")
-    axes[0].set_xlabel(feat[:30], fontsize=8)
-    axes[0].set_ylabel("Delivery Days")
-    try:
-        smoothed = lowess(sample["estimated_delivery_days"], clipped, frac=0.2)
-        axes[1].scatter(clipped, sample["estimated_delivery_days"], alpha=0.05, s=5)
-        axes[1].plot(smoothed[:, 0], smoothed[:, 1], color="red", linewidth=3)
-    except Exception:
-        axes[1].scatter(clipped, sample["estimated_delivery_days"], alpha=0.05, s=5)
-    axes[1].set_title(f"LOWESS: r={corr:.4f}")
-    if len(quintile_means) > 0:
-        axes[2].bar(range(len(quintile_means)), quintile_means.values, color="steelblue")
-        axes[2].set_xticks(range(len(quintile_means)))
-        axes[2].set_xticklabels([str(q)[:15] for q in quintile_means.index], rotation=30, ha="right", fontsize=7)
-        for j, v in enumerate(quintile_means.values):
-            axes[2].text(j, v + 0.1, f"{v:.1f}", ha="center", fontsize=8)
-    axes[2].set_title(f"Quintile Means — spread={spread:.2f}d")
-    fig.suptitle(f"{feat} | r={corr:.4f} | spread={spread:.2f} days", fontsize=10)
-    plt.tight_layout()
-    plt.show()
+        flag_stats = logistics.groupby(feat)["estimated_delivery_days"].agg(["mean", "std", "count"])
+        spread = flag_stats["mean"].max() - flag_stats["mean"].min()
+        print(f"\n=== {feat} (r={corr:.4f}, spread={spread:.2f} days) ===")
+        print(flag_stats.to_string())
 
 print("\n" + "=" * 60)
 print("FINAL RECOMMENDATION")
@@ -383,7 +344,6 @@ print(f"\n{'Feature':<45} {'Pearson r':>10} {'Spread':>8} {'Add?':>6}")
 print("-" * 71)
 
 for feat, corr in sorted(results.items(), key=lambda x: abs(x[1]), reverse=True):
-    logistics[feat] = combinations[feat]
     clean = logistics[[feat, "estimated_delivery_days"]].replace([np.inf, -np.inf], np.nan).dropna()
     if len(clean) < 100:
         spread = 0.0
@@ -393,6 +353,7 @@ for feat, corr in sorted(results.items(), key=lambda x: abs(x[1]), reverse=True)
             quintile_means = clean.groupby(bins, observed=True)["estimated_delivery_days"].mean()
             spread = quintile_means.max() - quintile_means.min()
         except Exception:
-            spread = 0.0
-    add = "YES" if abs(corr) > 0.05 and spread > 2.0 else "NO"
+            flag_means = logistics.groupby(feat)["estimated_delivery_days"].mean()
+            spread = flag_means.max() - flag_means.min()
+    add = "YES" if abs(corr) > 0.03 and spread > 1.0 else "NO"
     print(f"{feat:<45} {corr:>10.4f} {spread:>8.2f} {add:>6}")
