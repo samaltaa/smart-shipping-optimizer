@@ -56,6 +56,8 @@ def engineer_features(df, seller_volume_map, route_freq_map,
                       seller_high_installment_rate_map, seller_avg_order_value_map,
                       seller_age_map, city_density_map, daily_order_map,
                       rolling_7d_map, product_first_sale_map,
+                      seller_state_reach_map, seller_price_range_map,
+                      category_avg_photos_map, city_seller_concentration_map,
                       is_train=True):
     df = df.copy()
 
